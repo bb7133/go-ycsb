@@ -265,9 +265,29 @@ func (db *mysqlDB) execQuery(ctx context.Context, query string, args ...interfac
 	return err
 }
 
+func (db *mysqlDB) execTxn(ctx context.Context, tx *sql.Tx, query string, args ...interface{}) error {
+	if db.verbose {
+		fmt.Printf("%s %v\n", query, args)
+	}
+
+	stmt, err := db.getAndCacheStmt(ctx, query)
+	if err != nil {
+		return err
+	}
+
+	txnStmt := tx.Stmt(stmt)
+
+	_, err = txnStmt.ExecContext(ctx, args...)
+	db.clearCacheIfFailed(ctx, query, err)
+	return err
+}
+
 func (db *mysqlDB) Update(ctx context.Context, table string, key string, values map[string][]byte) error {
 	buf := db.bufPool.Get()
 	defer db.bufPool.Put(buf)
+
+	// Use explicit transaction
+	tx, err := db.db.BeginTx(ctx, nil)
 
 	buf.WriteString("UPDATE ")
 	buf.WriteString(table)
@@ -288,7 +308,18 @@ func (db *mysqlDB) Update(ctx context.Context, table string, key string, values 
 
 	args = append(args, key)
 
-	return db.execQuery(ctx, buf.String(), args...)
+	if err = db.execTxn(ctx, tx, buf.String(), args...); err != nil {
+		return err
+	}
+
+	// Commit explicit transaction
+	if err = tx.Commit(); err != nil {
+		if db.verbose {
+			fmt.Printf("Update commit failed, rollback.")
+		}
+		tx.Rollback()
+	}
+	return err
 }
 
 func (db *mysqlDB) Insert(ctx context.Context, table string, key string, values map[string][]byte) error {
